@@ -1,0 +1,141 @@
+name: Sync to Organization
+
+on:
+  workflow_call:
+    inputs:
+      target_repo:
+        required: true
+        type: string
+        description: '目标组织仓库，格式：org/repo'
+    secrets:
+      TARGET_PAT:
+        required: true
+        description: '访问目标仓库的 PAT'
+
+jobs:
+  sync-code:
+    name: Sync Code
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add target remote and fetch
+        id: fetch-target
+        run: |
+          git remote add target "https://x-access-token:${{ secrets.TARGET_PAT }}@github.com/${{ inputs.target_repo }}.git"
+          
+          if git fetch target main; then
+            echo "has_target_main=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_target_main=false" >> $GITHUB_OUTPUT
+            echo "⚠️ 目标仓库没有 main 分支，将直接推送"
+          fi
+
+      - name: Check version and push
+        run: |
+          SOURCE_HEAD=$(git rev-parse HEAD)
+          
+          # 目标为空仓库，直接推送
+          if [ "${{ steps.fetch-target.outputs.has_target_main }}" = "false" ]; then
+            echo "📤 目标仓库为空，直接推送..."
+            git push target HEAD:main
+            exit 0
+          fi
+          
+          TARGET_HEAD=$(git rev-parse target/main)
+          
+          # 已完全同步
+          if [ "$SOURCE_HEAD" = "$TARGET_HEAD" ]; then
+            echo "✅ 源仓库与目标仓库已同步，无需操作"
+            exit 0
+          fi
+          
+          # 严格检查：目标必须是源的祖先（即源严格领先）
+          if git merge-base --is-ancestor target/main HEAD; then
+            echo "📤 目标仓库落后于源仓库，准备推送..."
+            echo "   源 HEAD: $SOURCE_HEAD"
+            echo "   目标 HEAD: $TARGET_HEAD"
+            git push target HEAD:main --force-with-lease
+          else
+            echo "❌ 目标仓库版本高于源仓库版本（或历史分叉）"
+            echo "   源 HEAD: $SOURCE_HEAD"
+            echo "   目标 HEAD: $TARGET_HEAD"
+            exit 1
+          fi
+
+  sync-wiki:
+    name: Sync Wiki
+    needs: sync-code
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone source wiki
+        id: source-wiki
+        run: |
+          if git clone "https://github.com/${{ github.repository }}.wiki.git" source-wiki 2>/dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ 源仓库没有 Wiki"
+          fi
+
+      - name: Clone target wiki
+        id: target-wiki
+        run: |
+          if git clone "https://x-access-token:${{ secrets.TARGET_PAT }}@github.com/${{ inputs.target_repo }}.wiki.git" target-wiki 2>/dev/null; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ 目标仓库没有 Wiki，将初始化"
+          fi
+
+      - name: Sync wiki content
+        run: |
+          # 源无 Wiki，直接跳过
+          if [ "${{ steps.source-wiki.outputs.exists }}" = "false" ]; then
+            echo "✅ 源仓库无 Wiki，跳过"
+            exit 0
+          fi
+          
+          # 准备目标 wiki 目录
+          if [ "${{ steps.target-wiki.outputs.exists }}" = "false" ]; then
+            mkdir -p target-wiki
+            cd target-wiki
+            git init
+            git remote add origin "https://x-access-token:${{ secrets.TARGET_PAT }}@github.com/${{ inputs.target_repo }}.wiki.git"
+          else
+            cd target-wiki
+          fi
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # 完全镜像：删除目标中源没有的文件
+          rsync -av --delete ../source-wiki/ . --exclude '.git' --exclude '.gitignore'
+          
+          # 检查是否有实际变更
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "✅ Wiki 内容已同步，无需提交"
+            exit 0
+          fi
+          
+          git add -A
+          git commit -m "Sync wiki from ${{ github.repository }} ($(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
+          
+          # 推送（首次用 -u，后续直接 push）
+          if [ "${{ steps.target-wiki.outputs.exists }}" = "false" ]; then
+            git push -u origin master
+          else
+            git push origin master || {
+              echo "❌ Wiki 推送失败，可能目标 Wiki 已被他人更新"
+              exit 1
+            }
+          fi
