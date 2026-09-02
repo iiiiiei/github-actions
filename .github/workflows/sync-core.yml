@@ -133,7 +133,6 @@ jobs:
             draft=$(echo "$release" | jq -r '.draft')
             prerelease=$(echo "$release" | jq -r '.prerelease')
             
-            # 使用 jq 构建 JSON 避免 shell 转义问题
             jq -n \
               --arg tag_name "$tag" \
               --arg name "$name" \
@@ -272,13 +271,11 @@ jobs:
           
           echo "🔍 查询源仓库的 GHCR Packages..."
           
-          # 尝试用户端点
           gh api "users/$SOURCE_OWNER/packages?package_type=container" --paginate 2>/dev/null | \
             jq --arg repo "$SOURCE" '[.[] | select(.repository.full_name == $repo)]' > packages.json || echo "[]" > packages.json
           
           COUNT=$(jq 'length' packages.json)
           
-          # 如果为空且源属于组织，尝试组织端点
           if [ "$COUNT" -eq 0 ]; then
             gh api "orgs/$SOURCE_OWNER/packages?package_type=container" --paginate 2>/dev/null | \
               jq --arg repo "$SOURCE" '[.[] | select(.repository.full_name == $repo)]' > packages.json || echo "[]" > packages.json
@@ -314,7 +311,6 @@ jobs:
             
             versions=$(gh api "users/$SOURCE_OWNER/packages/container/$pkg_name/versions" --paginate 2>/dev/null || echo "[]")
             
-            # 如果用户端点为空，尝试组织端点
             if [ "$(echo "$versions" | jq 'length')" -eq 0 ]; then
               versions=$(gh api "orgs/$SOURCE_OWNER/packages/container/$pkg_name/versions" --paginate 2>/dev/null || echo "[]")
             fi
@@ -336,135 +332,4 @@ jobs:
             done
           done
           
-          echo "✅ Packages 同步完成"      - name: 配置 Git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-      - name: 清理目标镜像的 sync 工作流
-        run: |
-          if [ -f ".github/workflows/sync.yml" ]; then
-            git rm -f .github/workflows/sync.yml
-            git commit -m "chore: remove sync workflow for target mirror [skip ci]" --no-verify
-            echo "✅ 已移除 sync.yml，目标仓库将不会包含此文件"
-          else
-            echo "ℹ️ 未发现 sync.yml，无需清理"
-          fi
-
-      - name: 添加目标远程并获取分支
-        id: fetch-target
-        run: |
-          git remote add target "https://x-access-token:${{ secrets.TARGET_PAT }}@github.com/${{ inputs.target_repo }}.git"
-          if git fetch target main 2>/dev/null; then
-            echo "has_target_main=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_target_main=false" >> "$GITHUB_OUTPUT"
-            echo "⚠️ 目标仓库没有 main 分支，将直接推送"
-          fi
-
-      - name: 检查版本并推送
-        run: |
-          SOURCE_HEAD=$(git rev-parse HEAD)
-          
-          if [ "${{ steps.fetch-target.outputs.has_target_main }}" = "false" ]; then
-            echo "📤 目标仓库为空，直接推送..."
-            git push target HEAD:main
-            exit 0
-          fi
-          
-          TARGET_HEAD=$(git rev-parse target/main)
-          
-          if [ "$SOURCE_HEAD" = "$TARGET_HEAD" ]; then
-            echo "✅ 源仓库与目标仓库已同步，无需操作"
-            exit 0
-          fi
-          
-          if git merge-base --is-ancestor HEAD target/main; then
-            echo "❌ 目标仓库版本高于源仓库版本（或历史分叉）"
-            echo "   源 HEAD: $SOURCE_HEAD"
-            echo "   目标 HEAD: $TARGET_HEAD"
-            exit 1
-          fi
-          
-          echo "📤 目标仓库需要更新，准备推送..."
-          echo "   源 HEAD: $SOURCE_HEAD"
-          echo "   目标 HEAD: $TARGET_HEAD"
-          git push target HEAD:main --force-with-lease
-
-  sync-wiki:
-    name: 同步 Wiki
-    needs: sync-code
-    runs-on: ubuntu-latest
-    steps:
-      - name: 克隆源仓库 Wiki
-        id: source-wiki
-        run: |
-          if git clone "https://github.com/${{ github.repository }}.wiki.git" source-wiki 2>/dev/null; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "ℹ️ 源仓库没有 Wiki"
-          fi
-
-      - name: 同步 Wiki 到目标仓库
-        if: steps.source-wiki.outputs.exists == 'true'
-        run: |
-          TARGET_WIKI_URL="https://x-access-token:${{ secrets.TARGET_PAT }}@github.com/${{ inputs.target_repo }}.wiki.git"
-          
-          # 尝试克隆目标 wiki
-          if git clone "$TARGET_WIKI_URL" target-wiki 2>/dev/null; then
-            cd target-wiki
-            TARGET_EXISTS=true
-            echo "✅ 目标 Wiki 已存在"
-          else
-            echo "⚠️ 目标 Wiki 不存在，将初始化..."
-            mkdir -p target-wiki
-            cd target-wiki
-            git init
-            git remote add origin "$TARGET_WIKI_URL"
-            TARGET_EXISTS=false
-          fi
-          
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # 完全镜像同步
-          rsync -av --delete ../source-wiki/ . --exclude '.git' --exclude '.gitignore'
-          
-          # 检查是否有实际变更
-          if [ -z "$(git status --porcelain)" ]; then
-            echo "✅ Wiki 内容已同步，无需提交"
-            exit 0
-          fi
-          
-          git add -A
-          git commit -m "Sync wiki from ${{ github.repository }} ($(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
-          
-          # 推送逻辑
-          if [ "$TARGET_EXISTS" = "false" ]; then
-            if git push -u origin master 2>/dev/null; then
-              echo "✅ Wiki 已初始化并同步"
-            else
-              echo "⚠️ Git 推送失败，尝试通过 API 开启 Wiki..."
-              curl -s -X PATCH \
-                -H "Authorization: token ${{ secrets.TARGET_PAT }}" \
-                -H "Accept: application/vnd.github.v3+json" \
-                "https://api.github.com/repos/${{ inputs.target_repo }}" \
-                -d '{"has_wiki":true}' > /dev/null
-              
-              echo "⏳ 等待 GitHub 开启 Wiki..."
-              sleep 5
-              
-              if git push -u origin master 2>/dev/null; then
-                echo "✅ Wiki 已开启、初始化并同步"
-              else
-                echo "❌ 初始化目标 Wiki 失败。请手动在目标仓库 Settings → Features → Wikis 中开启 Wiki 功能"
-                exit 1
-              fi
-            fi
-          else
-            git push origin master || {
-              echo "❌ Wiki 推送失败，目标可能已被手动更新"
-              exit 1
-            }
-          fi
+          echo "✅ Packages 同步完成"
