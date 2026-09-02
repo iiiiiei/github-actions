@@ -1,2 +1,106 @@
-# github-actions
-Reusable workflows for syncing personal repos to organization
+# 仓库同步调度中心
+
+本仓库存放可复用的 GitHub Actions 工作流，用于将源仓库自动镜像同步到目标仓库。
+
+## 架构原理
+
+```
+源仓库/
+├── .github/
+│   └── workflows/
+│       └── sync.yml          # 触发器：14 行薄 wrapper
+│           ├── 监听 push → main
+│           └── 调用调度中心的 sync-core.yml
+│
+调度中心仓库/
+├── .github/
+│   └── workflows/
+│       └── sync-core.yml     # 核心逻辑（维护这一份即可）
+│           ├── Job 1: 同步代码
+│           │   ├── 清理 sync.yml（避免目标残留）
+│           │   ├── fetch 目标 main
+│           │   ├── 版本检查
+│           │   └── git push --force-with-lease
+│           └── Job 2: 同步 Wiki
+│               ├── clone 源 Wiki
+│               ├── clone 目标 Wiki（不存在则初始化）
+│               ├── rsync --delete 完全镜像
+│               └── git push
+│
+目标仓库/
+└── main                      # 纯净镜像，无 sync.yml
+└── Wiki/                     # 与源仓库 Wiki 完全一致
+```
+
+### 核心逻辑
+
+1. **触发**：源仓库的 `main` 分支发生 `push`，或手动触发 `workflow_dispatch`
+2. **调用**：源仓库通过 `uses` 引用本仓库的 Reusable Workflow
+3. **清理**：推送前自动移除 `.github/workflows/sync.yml`，避免目标仓库残留触发器
+4. **版本检查**：
+   - 目标为空 → 直接推送
+   - 目标与源相同 → 跳过
+   - 目标严格落后于源 → 安全推送（`--force-with-lease`）
+   - 目标领先或分叉 → **显式报错终止**，防止覆盖
+5. **Wiki 同步**：使用 `rsync --delete` 完全镜像；目标无 Wiki 时自动初始化
+
+### 安全机制
+
+- **PAT 隔离**：Token 由调用方仓库的 Secret 注入，调度中心不存储任何凭证
+- **防覆盖**：`--force-with-lease` + `merge-base` 双重校验，拒绝任何可能丢失提交的推送
+- **失败即停**：`sync-wiki` 依赖 `sync-code` 成功，任一环节失败立即终止
+
+## 文件结构
+
+```
+.github/workflows/
+└── sync-core.yml          # 核心同步逻辑（维护这一份即可）
+```
+
+## 新增仓库配置步骤
+
+### 1. 在源仓库创建触发器
+
+创建文件：`.github/workflows/sync.yml`
+
+```yaml
+# 自动同步工作流
+# 作用：当 main 分支有更新时，自动镜像推送到目标仓库
+# 注意：此文件仅在源仓库生效，目标仓库不会保留此文件
+
+name: Sync to Target
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  sync:
+    uses: <调度中心仓库>/.github/workflows/sync-core.yml@main
+    with:
+      target_repo: <目标仓库全名>
+    secrets:
+      TARGET_PAT: ${{ secrets.<PAT_SECRET名称> }}
+```
+
+> `<目标仓库全名>` 格式为 `所有者/仓库名`，例如 `someone/my-repo`。
+
+### 2. 配置 Secret
+
+在源仓库的 **Settings → Secrets and variables → Actions** 中添加：
+
+| Name | Value |
+|------|-------|
+| `<PAT_SECRET名称>` | 你的 Personal Access Token（需含 `repo` 权限，且对目标仓库有写权限） |
+
+### 3. 验证
+
+推送一次 `main` 分支，或手动触发 Actions，观察日志确认同步成功。
+
+## 维护说明
+
+- **修改同步逻辑**：只需更新本仓库的 `sync-core.yml`，所有引用它的仓库自动生效
+- **新增仓库**：仅需复制上述 14 行 `sync.yml`，修改 `target_repo` 即可
+- **目标仓库改名**：修改对应源仓库 `sync.yml` 中的 `target_repo`
+- **源仓库改名**：无需任何改动，`${{ github.repository }}` 自动识别
