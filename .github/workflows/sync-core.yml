@@ -27,40 +27,7 @@ jobs:
     name: Sync Code
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout source repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Configure Git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-      - name: Remove sync workflow for target mirror
-        run: |
-          if [ -f ".github/workflows/sync.yml" ]; then
-            git rm -f .github/workflows/sync.yml
-            git commit -m "chore: remove sync workflow for target mirror [skip ci]" --no-verify
-            echo "✅ 已移除 sync.yml，目标仓库将不会包含此文件"
-          else
-            echo "ℹ️ 未发现 sync.yml，无需清理"
-          fi
-
-      - name: Add target remote and fetch
-        id: fetch-target
-        run: |
-          git remote add target "https://x-access-token:${{ secrets.TARGET_PAT }}@github.com/${{ inputs.target_repo }}.git"
-          
-          if git fetch target main; then
-            echo "has_target_main=true" >> $GITHUB_OUTPUT
-          else
-            echo "has_target_main=false" >> $GITHUB_OUTPUT
-            echo "⚠️ 目标仓库没有 main 分支，将直接推送"
-          fi
-
-      - name: Check version and push
+            - name: Check version and push
         run: |
           SOURCE_HEAD=$(git rev-parse HEAD)
           
@@ -79,18 +46,22 @@ jobs:
             exit 0
           fi
           
-          # 严格检查：目标必须是源的祖先（即源严格领先）
-          if git merge-base --is-ancestor target/main HEAD; then
-            echo "📤 目标仓库落后于源仓库，准备推送..."
-            echo "   源 HEAD: $SOURCE_HEAD"
-            echo "   目标 HEAD: $TARGET_HEAD"
-            git push target HEAD:main --force-with-lease
-          else
+          # 检查源是否落后于目标（源是目标的祖先）
+          # 这种情况说明目标有人手动提交，必须拒绝覆盖
+          if git merge-base --is-ancestor HEAD target/main; then
             echo "❌ 目标仓库版本高于源仓库版本（或历史分叉）"
             echo "   源 HEAD: $SOURCE_HEAD"
             echo "   目标 HEAD: $TARGET_HEAD"
             exit 1
           fi
+          
+          # 其他情况都允许推送：
+          # 1. 目标落后（目标是源的祖先）→ 正常同步
+          # 2. 历史分叉 → 由 runner 生成的镜像 commit 导致，属于正常现象
+          echo "📤 目标仓库需要更新，准备推送..."
+          echo "   源 HEAD: $SOURCE_HEAD"
+          echo "   目标 HEAD: $TARGET_HEAD"
+          git push target HEAD:main --force-with-lease
 
   sync-wiki:
     name: Sync Wiki
