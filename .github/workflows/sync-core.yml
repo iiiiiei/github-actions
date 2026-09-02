@@ -1,15 +1,17 @@
 # ------------------------------------------------------------------------------
 # 可复用的仓库同步核心逻辑
-# 作用：将源仓库的 main 分支 + Wiki 严格镜像到目标组织仓库
+# 作用：将源仓库的 main 分支 + Tags + Wiki + Releases + Packages 镜像到目标仓库
 # 安全机制：
 #   1. 仅当目标仓库是源仓库的严格祖先时才推送（--force-with-lease）
 #   2. 若目标仓库领先或分叉，显式报错"目标仓库版本高于源仓库版本"
 #   3. 推送前自动移除 .github/workflows/sync.yml，避免目标仓库残留触发器
 #   4. 源有 Wiki 但目标无 Wiki 时，自动初始化并同步
-# 调用方式：在个人仓库创建 14 行的 sync.yml 调用此文件
+#   5. Releases 通过 GitHub API 同步，不覆盖已存在的 Release
+#   6. Packages 通过 docker pull/tag/push 同步 GHCR 镜像
+# 调用方式：在源仓库创建薄 wrapper 调用此文件
 # ------------------------------------------------------------------------------
 
-name: Sync to Organization
+name: Sync to Target
 
 on:
   workflow_call:
@@ -17,7 +19,7 @@ on:
       target_repo:
         required: true
         type: string
-        description: '目标组织仓库，格式：org/repo'
+        description: '目标仓库，格式：所有者/仓库名'
     secrets:
       TARGET_PAT:
         required: true
@@ -25,7 +27,7 @@ on:
 
 jobs:
   sync-code:
-    name: 同步代码
+    name: 同步代码与标签
     runs-on: ubuntu-latest
     steps:
       - name: 检出源仓库
@@ -35,6 +37,306 @@ jobs:
           persist-credentials: false
 
       - name: 配置 Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: 清理目标镜像的 sync 工作流
+        run: |
+          if [ -f ".github/workflows/sync.yml" ]; then
+            git rm -f .github/workflows/sync.yml
+            git commit -m "chore: remove sync workflow for target mirror [skip ci]" --no-verify
+            echo "✅ 已移除 sync.yml，目标仓库将不会包含此文件"
+          else
+            echo "ℹ️ 未发现 sync.yml，无需清理"
+          fi
+
+      - name: 添加目标远程并获取分支
+        id: fetch-target
+        run: |
+          git remote add target "https://x-access-token:${{ secrets.TARGET_PAT }}@github.com/${{ inputs.target_repo }}.git"
+          if git fetch target main 2>/dev/null; then
+            echo "has_target_main=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_target_main=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️ 目标仓库没有 main 分支，将直接推送"
+          fi
+
+      - name: 检查版本并推送代码
+        run: |
+          SOURCE_HEAD=$(git rev-parse HEAD)
+          
+          if [ "${{ steps.fetch-target.outputs.has_target_main }}" = "false" ]; then
+            echo "📤 目标仓库为空，直接推送..."
+            git push target HEAD:main
+          else
+            TARGET_HEAD=$(git rev-parse target/main)
+            
+            if [ "$SOURCE_HEAD" = "$TARGET_HEAD" ]; then
+              echo "✅ 源仓库与目标仓库已同步，无需操作"
+            elif git merge-base --is-ancestor HEAD target/main; then
+              echo "❌ 目标仓库版本高于源仓库版本（或历史分叉）"
+              echo "   源 HEAD: $SOURCE_HEAD"
+              echo "   目标 HEAD: $TARGET_HEAD"
+              exit 1
+            else
+              echo "📤 目标仓库需要更新，准备推送..."
+              echo "   源 HEAD: $SOURCE_HEAD"
+              echo "   目标 HEAD: $TARGET_HEAD"
+              git push target HEAD:main --force-with-lease
+            fi
+          fi
+
+      - name: 同步 Tags
+        run: |
+          echo "📤 同步 Tags..."
+          git push target --tags 2>/dev/null || echo "⚠️ 部分 Tags 同步失败（可能目标已有相同 Tag）"
+
+  sync-releases:
+    name: 同步 Releases
+    needs: sync-code
+    runs-on: ubuntu-latest
+    steps:
+      - name: 同步 Releases
+        env:
+          GH_TOKEN: ${{ secrets.TARGET_PAT }}
+        run: |
+          SOURCE="${{ github.repository }}"
+          TARGET="${{ inputs.target_repo }}"
+          
+          echo "🔍 获取源仓库 Releases..."
+          gh api "repos/$SOURCE/releases" --paginate > source_releases.json 2>/dev/null || echo "[]" > source_releases.json
+          
+          echo "🔍 获取目标仓库 Releases..."
+          gh api "repos/$TARGET/releases" --paginate > target_releases.json 2>/dev/null || echo "[]" > target_releases.json
+          
+          SOURCE_COUNT=$(jq 'length' source_releases.json)
+          if [ "$SOURCE_COUNT" -eq 0 ]; then
+            echo "ℹ️ 源仓库没有 Releases，跳过"
+            exit 0
+          fi
+          
+          echo "📦 源仓库有 $SOURCE_COUNT 个 Releases，开始同步..."
+          
+          jq -c '.[]' source_releases.json | while read -r release; do
+            tag=$(echo "$release" | jq -r '.tag_name')
+            
+            if jq -e --arg tag "$tag" '.[] | select(.tag_name == $tag)' target_releases.json > /dev/null 2>&1; then
+              echo "✅ Release $tag 已存在，跳过"
+              continue
+            fi
+            
+            echo "📤 创建 Release: $tag"
+            
+            name=$(echo "$release" | jq -r '.name')
+            body=$(echo "$release" | jq -r '.body // ""')
+            draft=$(echo "$release" | jq -r '.draft')
+            prerelease=$(echo "$release" | jq -r '.prerelease')
+            
+            # 使用 jq 构建 JSON 避免 shell 转义问题
+            jq -n \
+              --arg tag_name "$tag" \
+              --arg name "$name" \
+              --arg body "$body" \
+              --argjson draft "$draft" \
+              --argjson prerelease "$prerelease" \
+              '{tag_name: $tag_name, name: $name, body: $body, draft: $draft, prerelease: $prerelease}' > release_payload.json
+            
+            created=$(gh api "repos/$TARGET/releases" \
+              -X POST \
+              --input release_payload.json \
+              --jq '.id')
+            
+            if [ -z "$created" ] || [ "$created" = "null" ]; then
+              echo "⚠️ Release $tag 创建失败，可能对应 Tag 不存在"
+              continue
+            fi
+            
+            echo "✅ Release $tag 创建成功 (ID: $created)"
+            
+            assets=$(echo "$release" | jq -c '.assets // []')
+            asset_count=$(echo "$assets" | jq 'length')
+            
+            if [ "$asset_count" -gt 0 ]; then
+              echo "   📎 同步 $asset_count 个 Assets..."
+              
+              echo "$assets" | jq -c '.[]' | while read -r asset; do
+                asset_name=$(echo "$asset" | jq -r '.name')
+                asset_url=$(echo "$asset" | jq -r '.url')
+                
+                echo "   📥 下载: $asset_name"
+                curl -sL -H "Authorization: token ${{ secrets.TARGET_PAT }}" \
+                     -H "Accept: application/octet-stream" \
+                     "$asset_url" > "$asset_name"
+                
+                echo "   📤 上传: $asset_name"
+                gh api "repos/$TARGET/releases/$created/assets?name=$asset_name" \
+                  -X POST \
+                  -H "Content-Type: application/octet-stream" \
+                  --input "$asset_name" > /dev/null 2>&1 || echo "   ⚠️ 上传失败: $asset_name"
+                
+                rm -f "$asset_name"
+              done
+            fi
+          done
+          
+          rm -f release_payload.json source_releases.json target_releases.json
+          echo "✅ Releases 同步完成"
+
+  sync-wiki:
+    name: 同步 Wiki
+    needs: sync-code
+    runs-on: ubuntu-latest
+    steps:
+      - name: 克隆源仓库 Wiki
+        id: source-wiki
+        run: |
+          if git clone "https://github.com/${{ github.repository }}.wiki.git" source-wiki 2>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "ℹ️ 源仓库没有 Wiki"
+          fi
+
+      - name: 同步 Wiki 到目标仓库
+        if: steps.source-wiki.outputs.exists == 'true'
+        run: |
+          TARGET_WIKI_URL="https://x-access-token:${{ secrets.TARGET_PAT }}@github.com/${{ inputs.target_repo }}.wiki.git"
+          
+          if git clone "$TARGET_WIKI_URL" target-wiki 2>/dev/null; then
+            cd target-wiki
+            TARGET_EXISTS=true
+            echo "✅ 目标 Wiki 已存在"
+          else
+            echo "⚠️ 目标 Wiki 不存在，将初始化..."
+            mkdir -p target-wiki
+            cd target-wiki
+            git init
+            git remote add origin "$TARGET_WIKI_URL"
+            TARGET_EXISTS=false
+          fi
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          rsync -av --delete ../source-wiki/ . --exclude '.git' --exclude '.gitignore'
+          
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "✅ Wiki 内容已同步，无需提交"
+            exit 0
+          fi
+          
+          git add -A
+          git commit -m "Sync wiki from ${{ github.repository }} ($(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
+          
+          if [ "$TARGET_EXISTS" = "false" ]; then
+            if git push -u origin master 2>/dev/null; then
+              echo "✅ Wiki 已初始化并同步"
+            else
+              echo "⚠️ Git 推送失败，尝试通过 API 开启 Wiki..."
+              curl -s -X PATCH \
+                -H "Authorization: token ${{ secrets.TARGET_PAT }}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/${{ inputs.target_repo }}" \
+                -d '{"has_wiki":true}' > /dev/null
+              
+              echo "⏳ 等待 GitHub 开启 Wiki..."
+              sleep 5
+              
+              if git push -u origin master 2>/dev/null; then
+                echo "✅ Wiki 已开启、初始化并同步"
+              else
+                echo "❌ 初始化目标 Wiki 失败。请手动在目标仓库 Settings → Features → Wikis 中开启 Wiki 功能"
+                exit 1
+              fi
+            fi
+          else
+            git push origin master || {
+              echo "❌ Wiki 推送失败，目标可能已被手动更新"
+              exit 1
+            }
+          fi
+
+  sync-packages:
+    name: 同步 Packages (GHCR)
+    needs: sync-code
+    runs-on: ubuntu-latest
+    steps:
+      - name: 获取源仓库 Packages
+        id: list-packages
+        env:
+          GH_TOKEN: ${{ secrets.TARGET_PAT }}
+        run: |
+          SOURCE="${{ github.repository }}"
+          SOURCE_OWNER=$(echo "$SOURCE" | cut -d'/' -f1)
+          
+          echo "🔍 查询源仓库的 GHCR Packages..."
+          
+          # 尝试用户端点
+          gh api "users/$SOURCE_OWNER/packages?package_type=container" --paginate 2>/dev/null | \
+            jq --arg repo "$SOURCE" '[.[] | select(.repository.full_name == $repo)]' > packages.json || echo "[]" > packages.json
+          
+          COUNT=$(jq 'length' packages.json)
+          
+          # 如果为空且源属于组织，尝试组织端点
+          if [ "$COUNT" -eq 0 ]; then
+            gh api "orgs/$SOURCE_OWNER/packages?package_type=container" --paginate 2>/dev/null | \
+              jq --arg repo "$SOURCE" '[.[] | select(.repository.full_name == $repo)]' > packages.json || echo "[]" > packages.json
+            COUNT=$(jq 'length' packages.json)
+          fi
+          
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          
+          if [ "$COUNT" -eq 0 ]; then
+            echo "ℹ️ 源仓库没有 GHCR Packages，跳过"
+          else
+            echo "📦 发现 $COUNT 个 GHCR Packages"
+          fi
+
+      - name: 登录 GitHub Container Registry
+        if: steps.list-packages.outputs.count > 0
+        run: |
+          echo "${{ secrets.TARGET_PAT }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: 同步 Container Images
+        if: steps.list-packages.outputs.count > 0
+        env:
+          GH_TOKEN: ${{ secrets.TARGET_PAT }}
+        run: |
+          SOURCE="${{ github.repository }}"
+          TARGET="${{ inputs.target_repo }}"
+          SOURCE_OWNER=$(echo "$SOURCE" | cut -d'/' -f1)
+          TARGET_OWNER=$(echo "$TARGET" | cut -d'/' -f1)
+          
+          jq -c '.[]' packages.json | while read -r pkg; do
+            pkg_name=$(echo "$pkg" | jq -r '.name')
+            echo "📦 同步 Package: $pkg_name"
+            
+            versions=$(gh api "users/$SOURCE_OWNER/packages/container/$pkg_name/versions" --paginate 2>/dev/null || echo "[]")
+            
+            # 如果用户端点为空，尝试组织端点
+            if [ "$(echo "$versions" | jq 'length')" -eq 0 ]; then
+              versions=$(gh api "orgs/$SOURCE_OWNER/packages/container/$pkg_name/versions" --paginate 2>/dev/null || echo "[]")
+            fi
+            
+            echo "$versions" | jq -c '.[]' | while read -r ver; do
+              ver_tags=$(echo "$ver" | jq -r '.metadata.container.tags[]? // empty')
+              
+              for tag in $ver_tags; do
+                source_image="ghcr.io/$SOURCE_OWNER/$pkg_name:$tag"
+                target_image="ghcr.io/$TARGET_OWNER/$pkg_name:$tag"
+                
+                echo "   🔄 $source_image → $target_image"
+                
+                docker pull "$source_image" 2>/dev/null || { echo "   ⚠️ 拉取失败: $source_image"; continue; }
+                docker tag "$source_image" "$target_image"
+                docker push "$target_image" 2>/dev/null || echo "   ⚠️ 推送失败: $target_image"
+                docker rmi "$target_image" "$source_image" 2>/dev/null || true
+              done
+            done
+          done
+          
+          echo "✅ Packages 同步完成"      - name: 配置 Git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
