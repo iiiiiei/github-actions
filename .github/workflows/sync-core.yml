@@ -1,3 +1,13 @@
+# ------------------------------------------------------------------------------
+# 可复用的仓库同步核心逻辑
+# 作用：将源仓库的 main 分支 + Wiki 严格镜像到目标组织仓库
+# 安全机制：
+#   1. 仅当目标仓库是源仓库的严格祖先时才推送（--force-with-lease）
+#   2. 若目标仓库领先或分叉，显式报错"目标仓库版本高于源仓库版本"
+#   3. 推送前自动移除 .github/workflows/sync.yml，避免目标仓库残留触发器
+# 调用方式：在个人仓库创建 14 行的 sync.yml 调用此文件
+# ------------------------------------------------------------------------------
+
 name: Sync to Organization
 
 on:
@@ -27,6 +37,16 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Remove sync workflow for target mirror
+        run: |
+          if [ -f ".github/workflows/sync.yml" ]; then
+            git rm -f .github/workflows/sync.yml
+            git commit -m "chore: remove sync workflow for target mirror [skip ci]" --no-verify
+            echo "✅ 已移除 sync.yml，目标仓库将不会包含此文件"
+          else
+            echo "ℹ️ 未发现 sync.yml，无需清理"
+          fi
 
       - name: Add target remote and fetch
         id: fetch-target
