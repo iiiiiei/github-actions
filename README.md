@@ -1,5 +1,7 @@
 # 仓库同步调度中心
 
+[简体中文](./README.md)｜[English](./README_EN.md)
+
 本仓库存放可复用的 GitHub Actions 工作流，用于将源仓库自动镜像同步到目标仓库。
 
 ## 架构原理
@@ -88,7 +90,15 @@
 
 ## 新增仓库配置步骤
 
-### 1. 在源仓库创建触发器
+### 1. 配置 Secret
+
+在源仓库的 **Settings → Secrets and variables → Actions** 中添加：
+
+| Name | Value |
+|------|-------|
+| `<PAT_SECRET名称>` | 你的 Personal Access Token（权限见上文"前置条件"） |
+
+### 2. 在源仓库创建触发器
 
 创建文件：`.github/workflows/sync.yml`
 
@@ -114,14 +124,6 @@ jobs:
 ```
 
 > `<目标仓库全名>` 格式为 `所有者/仓库名`，例如 `someone/my-repo`。
-
-### 2. 配置 Secret
-
-在源仓库的 **Settings → Secrets and variables → Actions** 中添加：
-
-| Name | Value |
-|------|-------|
-| `<PAT_SECRET名称>` | 你的 Personal Access Token（权限见上文"前置条件"） |
 
 ### 3. 验证
 
